@@ -46,6 +46,20 @@ class AdminScheduler(FakeScheduler):
         return {"success": True, "message": "ok", "data": {"action": action}}
 
 
+@pytest.fixture
+def stage() -> Stage:
+    return Stage(
+        name="decoder",
+        role="single",
+        get_next=lambda request_id, output: None,
+        gpu_id=None,
+        endpoints={},
+        control_plane=RecordingStageControlPlane(),
+        relay=FakeRelay(),
+        scheduler=AdminScheduler(),
+    )
+
+
 def make_memory_scheduler():
     from sglang_omni.scheduling.omni_scheduler import OmniScheduler
 
@@ -64,11 +78,9 @@ def make_memory_scheduler():
     scheduler._last_pause_mode = None
     scheduler.memory_manager = Mock()
     scheduler.memory_allocator = Mock()
-    scheduler.memory_worker_shared = False
     scheduler.released_memory_tags = set()
     scheduler.memory_transition_active = False
     scheduler.memory_transition_failed = False
-    scheduler.memory_pause_before_transition = False
     scheduler.paused_before_memory_release = False
     scheduler.request_build_idle_callback = None
     scheduler._deferred_request_payloads = {}
@@ -83,6 +95,13 @@ def make_memory_scheduler():
 def memory_scheduler(monkeypatch):
     monkeypatch.setattr("torch.get_device_module", lambda *args: Mock())
     return make_memory_scheduler()
+
+
+@pytest.fixture
+def memory_control(memory_scheduler):
+    return WorkerMemoryControl(
+        {"asr": memory_scheduler.admin_memory_phase}, worker="audio"
+    )
 
 
 @pytest.fixture
@@ -124,23 +143,37 @@ def test_worker_memory_freezes_all_stages_before_one_allocator_release(
     assert allocator.pause.call_count == 3
 
 
-def test_worker_partial_resume_preserves_each_stages_pause(worker_memory) -> None:
-    controller, schedulers = worker_memory
-    schedulers["decoder"]._engine_paused = True
+@pytest.mark.parametrize("worker_scoped", [False, True])
+def test_memory_partial_resume_and_idempotency(
+    memory_scheduler, memory_control, worker_memory, worker_scoped
+) -> None:
+    controller, schedulers = (
+        worker_memory if worker_scoped else (memory_control, {"asr": memory_scheduler})
+    )
+    if worker_scoped:
+        schedulers["decoder"]._engine_paused = True
+    controller.run("resume_memory_occupation", {})
+    for name, scheduler in schedulers.items():
+        assert scheduler._engine_paused == (name == "decoder")
+    controller.run("release_memory_occupation", {})
     controller.run("release_memory_occupation", {})
     controller.run("resume_memory_occupation", {"tags": ["weights"]})
-    assert all(scheduler._engine_paused for scheduler in schedulers.values())
-    assert all(
-        scheduler.released_memory_tags == {"kv_cache", "cuda_graph"}
-        for scheduler in schedulers.values()
-    )
+    for scheduler in schedulers.values():
+        scheduler.memory_manager.release_memory_occupation.assert_called_once()
+        assert scheduler._engine_paused
+        assert scheduler.released_memory_tags == {"kv_cache", "cuda_graph"}
+        with pytest.raises(RuntimeError, match="resume memory first"):
+            scheduler.admin_continue_generation({})
+    controller.run("resume_memory_occupation", {})
     result = controller.run("resume_memory_occupation", {})
-    assert not schedulers["asr"]._engine_paused
-    assert schedulers["decoder"]._engine_paused
-    assert result["data"]["engine_paused"]
-    assert all(not scheduler.released_memory_tags for scheduler in schedulers.values())
+    assert result["data"]["engine_paused"] == worker_scoped
+    for name, scheduler in schedulers.items():
+        assert scheduler._engine_paused == (name == "decoder")
+        assert not scheduler.released_memory_tags
+        assert scheduler.memory_manager.resume_memory_occupation.call_count == 2
     assert schedulers["asr"].memory_allocator.resume.call_count == 3
-    schedulers["decoder"].memory_allocator.resume.assert_not_called()
+    if worker_scoped:
+        schedulers["decoder"].memory_allocator.resume.assert_not_called()
 
 
 def test_worker_busy_peer_cancels_preparation_without_releasing(worker_memory) -> None:
@@ -178,18 +211,8 @@ def test_worker_cancels_prepare_that_runs_after_timeout(worker_memory, paused) -
         scheduler.memory_allocator.pause.assert_not_called()
 
 
-def test_stage_memory_request_controls_colocated_stages(worker_memory) -> None:
+def test_stage_memory_request_controls_colocated_stages(stage, worker_memory) -> None:
     controller, schedulers = worker_memory
-    stage = Stage(
-        name="decoder",
-        role="single",
-        get_next=lambda request_id, output: None,
-        gpu_id=None,
-        endpoints={},
-        control_plane=RecordingStageControlPlane(),
-        relay=FakeRelay(),
-        scheduler=AdminScheduler(),
-    )
     stage.memory_control = controller
     result = asyncio.run(
         stage.run_admin_operation(
@@ -208,21 +231,9 @@ def test_stage_memory_request_controls_colocated_stages(worker_memory) -> None:
     )
 
 
-def test_colocated_stage_cannot_bypass_worker_memory_control(memory_scheduler) -> None:
-    memory_scheduler.memory_worker_shared = True
-    with pytest.raises(RuntimeError, match="worker memory control"):
-        memory_scheduler.admin_memory_occupation("release_memory_occupation", {})
-    memory_scheduler.memory_allocator.pause.assert_not_called()
-
-
 def test_memory_preparation_blocks_other_admin_actions(memory_scheduler) -> None:
-    memory_scheduler.admin_memory_phase(
-        {
-            "phase": "prepare",
-            "action": "release_memory_occupation",
-            "tags": ["weights"],
-        }
-    )
+    payload = {"action": "release_memory_occupation", "tags": ["weights"]}
+    memory_scheduler.admin_memory_phase({**payload, "phase": "prepare"})
     for action in (
         "continue_generation",
         "update_weights_from_disk",
@@ -230,13 +241,7 @@ def test_memory_preparation_blocks_other_admin_actions(memory_scheduler) -> None
     ):
         with pytest.raises(RuntimeError, match="resume memory first"):
             memory_scheduler.run_admin_action(action, {})
-    memory_scheduler.admin_memory_phase(
-        {
-            "phase": "cancel",
-            "action": "release_memory_occupation",
-            "tags": [],
-        }
-    )
+    memory_scheduler.admin_memory_phase({**payload, "phase": "cancel"})
     assert not memory_scheduler._engine_paused
 
 
@@ -321,7 +326,7 @@ def test_worker_memory_runs_phases_on_each_scheduler_thread(worker_memory) -> No
 @pytest.mark.parametrize("pending_kind", ["builder", "admission", "builder_admission"])
 @pytest.mark.parametrize("evict_aborts", [False, True])
 def test_memory_waits_for_aborted_request_work(
-    memory_scheduler, pending_kind, evict_aborts, monkeypatch
+    memory_scheduler, memory_control, pending_kind, evict_aborts, monkeypatch
 ) -> None:
     scheduler = memory_scheduler
     del scheduler.active_request_ids
@@ -369,69 +374,58 @@ def test_memory_waits_for_aborted_request_work(
         for index in range(3):
             scheduler.abort(f"other-{index}")
     with pytest.raises(RuntimeError, match="active requests"):
-        scheduler.admin_memory_occupation("release_memory_occupation", {})
+        memory_control.run("release_memory_occupation", {})
     scheduler.memory_allocator.pause.assert_not_called()
 
     if pending_kind == "builder_admission":
         builder.set_result(deferred)
         scheduler.drain_request_build_results()
         with pytest.raises(RuntimeError, match="active requests"):
-            scheduler.admin_memory_occupation("release_memory_occupation", {})
+            memory_control.run("release_memory_occupation", {})
     elif pending_kind == "builder":
         builder.set_result(object())
     ready.set_result(None)
     scheduler.drain_request_build_results()
     scheduler.drain_request_admission_results()
-    assert scheduler.admin_memory_occupation("release_memory_occupation", {})["success"]
+    assert memory_control.run("release_memory_occupation", {})["success"]
     scheduler.enqueue_built_request.assert_not_called()
 
 
-def test_memory_partial_resume_and_idempotency(memory_scheduler) -> None:
-    scheduler = memory_scheduler
-    release = "release_memory_occupation"
-    resume = "resume_memory_occupation"
-    scheduler.admin_memory_occupation(release, {})
-    scheduler.admin_memory_occupation(release, {})
-    assert scheduler.memory_manager.release_memory_occupation.call_count == 1
-    assert scheduler._engine_paused
-    scheduler.admin_memory_occupation(resume, {"tags": ["weights"]})
-    assert scheduler.released_memory_tags == {"kv_cache", "cuda_graph"}
-    assert scheduler._engine_paused
-    with pytest.raises(RuntimeError, match="resume memory first"):
-        scheduler.admin_continue_generation({})
-    scheduler.admin_memory_occupation(resume, {})
-    scheduler.admin_memory_occupation(resume, {})
-    assert scheduler.memory_manager.resume_memory_occupation.call_count == 2
-    assert scheduler.released_memory_tags == set()
-    assert not scheduler._engine_paused
-
-
 @pytest.mark.parametrize("tags", [["unknown"], "weights", [1]])
-def test_memory_rejects_invalid_tags(memory_scheduler, tags) -> None:
+def test_memory_rejects_invalid_tags(memory_scheduler, memory_control, tags) -> None:
     with pytest.raises(ValueError, match="tags"):
-        memory_scheduler.admin_memory_occupation(
-            "release_memory_occupation", {"tags": tags}
-        )
+        memory_control.run("release_memory_occupation", {"tags": tags})
     memory_scheduler.memory_manager.release_memory_occupation.assert_not_called()
 
 
-@pytest.mark.parametrize("active", [True, False])
-def test_memory_requires_idle_stage(memory_scheduler, active) -> None:
-    memory_scheduler.active_request_ids = lambda: ["request"] if active else []
-    memory_scheduler.is_fully_idle = lambda: active
+@pytest.mark.parametrize(
+    "field, value",
+    [
+        ("active_request_ids", lambda: ["request"]),
+        ("is_fully_idle", lambda: False),
+        ("_deferred_request_payloads", {"stream": object()}),
+        ("_pending_stream_ingress", {"stream": object()}),
+    ],
+)
+def test_memory_requires_idle_stage(
+    memory_scheduler, memory_control, field, value
+) -> None:
+    setattr(memory_scheduler, field, value)
     with pytest.raises(RuntimeError, match="active requests"):
-        memory_scheduler.admin_memory_occupation("release_memory_occupation", {})
+        memory_control.run("release_memory_occupation", {})
     assert not memory_scheduler._engine_paused
     memory_scheduler.memory_manager.release_memory_occupation.assert_not_called()
 
 
-def test_memory_requires_enabled_allocator(memory_scheduler) -> None:
+def test_memory_requires_enabled_allocator(memory_scheduler, memory_control) -> None:
     memory_scheduler.tp_worker.model_runner.server_args.enable_memory_saver = False
     with pytest.raises(RuntimeError, match="enable_memory_saver"):
-        memory_scheduler.admin_memory_occupation("release_memory_occupation", {})
+        memory_control.run("release_memory_occupation", {})
 
 
-def test_memory_waits_for_timed_out_encoder_work(memory_scheduler) -> None:
+def test_memory_waits_for_timed_out_encoder_work(
+    memory_scheduler, memory_control
+) -> None:
     from sglang_omni.models.moss_transcribe_diarize.encoder_service import (
         BatchedAudioEncoderService,
     )
@@ -448,19 +442,19 @@ def test_memory_waits_for_timed_out_encoder_work(memory_scheduler) -> None:
     entry = service._queue.get_nowait()
     entry.future.cancel()
     with pytest.raises(RuntimeError, match="active requests"):
-        memory_scheduler.admin_memory_occupation("release_memory_occupation", {})
+        memory_control.run("release_memory_occupation", {})
     memory_scheduler.memory_allocator.pause.assert_not_called()
 
     service.set_result(entry, object())
-    assert memory_scheduler.admin_memory_occupation("release_memory_occupation", {})[
-        "success"
-    ]
+    assert memory_control.run("release_memory_occupation", {})["success"]
 
 
-def test_memory_rejects_unsynchronized_tp_control(memory_scheduler) -> None:
+def test_memory_rejects_unsynchronized_tp_control(
+    memory_scheduler, memory_control
+) -> None:
     memory_scheduler.tp_size = 2
     with pytest.raises(RuntimeError, match="tp_size=1"):
-        memory_scheduler.admin_memory_occupation("release_memory_occupation", {})
+        memory_control.run("release_memory_occupation", {})
     memory_scheduler.memory_manager.release_memory_occupation.assert_not_called()
 
 
@@ -496,7 +490,6 @@ def test_memory_bridges_upstream_allocator_and_restores_buffers(
         worker="audio",
     )
     monkeypatch.setattr(torch.distributed, "barrier", Mock())
-    monkeypatch.setattr(torch, "get_device_module", lambda *args: Mock())
     controller.run("release_memory_occupation", {})
     assert [call.args[0] for call in adapter.pause.call_args_list] == [
         "kv_cache",
@@ -533,18 +526,6 @@ def test_sleeping_stage_rejects_requests_without_building(
 
 
 @pytest.mark.parametrize(
-    "pending_field", ["_deferred_request_payloads", "_pending_stream_ingress"]
-)
-def test_memory_rejects_pending_stream_requests(
-    memory_scheduler, pending_field
-) -> None:
-    getattr(memory_scheduler, pending_field)["stream"] = object()
-    with pytest.raises(RuntimeError, match="active requests"):
-        memory_scheduler.admin_memory_occupation("release_memory_occupation", {})
-    memory_scheduler.memory_manager.release_memory_occupation.assert_not_called()
-
-
-@pytest.mark.parametrize(
     "action", ["release_memory_occupation", "resume_memory_occupation"]
 )
 def test_memory_rejects_pd_stages(action) -> None:
@@ -556,7 +537,9 @@ def test_memory_rejects_pd_stages(action) -> None:
     for scheduler_type in (OmniDecodeScheduler, OmniPrefillScheduler):
         scheduler = object.__new__(scheduler_type)
         with pytest.raises(RuntimeError, match="does not support PD stages"):
-            scheduler.admin_memory_occupation(action, {})
+            scheduler.admin_memory_phase(
+                {"phase": "prepare", "action": action, "tags": []}
+            )
 
 
 def test_admin_messages_round_trip() -> None:
@@ -1067,34 +1050,27 @@ def test_coordinator_admin_waits_for_all_stage_results() -> None:
 @pytest.mark.parametrize(
     "action, has_handler, error",
     [
-        ("release_memory_occupation", False, "does not support memory"),
+        ("release_memory_occupation", False, "requires a supported worker"),
+        ("release_memory_occupation", True, "requires a supported worker"),
+        ("resume_memory_occupation", True, "requires a supported worker"),
         (ADMIN_MEMORY_CONTROL, False, "internal worker operations"),
         (ADMIN_MEMORY_CONTROL, True, "internal worker operations"),
     ],
 )
-def test_stage_rejects_unsupported_memory_admin(action, has_handler, error) -> None:
+def test_stage_rejects_unsupported_memory_admin(
+    stage, action, has_handler, error
+) -> None:
     scheduler = FakeScheduler()
     handler = Mock()
     if has_handler:
         scheduler.admin = handler
-    stage = Stage(
-        name="preprocess",
-        role="single",
-        get_next=lambda request_id, output: None,
-        gpu_id=None,
-        endpoints={},
-        control_plane=RecordingStageControlPlane(),
-        relay=FakeRelay(),
-        scheduler=scheduler,
-    )
+    stage.scheduler = scheduler
     result = asyncio.run(
         stage.run_admin_operation(AdminOperation(op_id="memory", action=action))
     )
     assert not result.success
     assert error in result.error
     handler.assert_not_called()
-
-
 def test_stage_admin_dispatches_to_scheduler() -> None:
     async def run() -> None:
         scheduler = AdminScheduler()
@@ -1120,8 +1096,8 @@ def test_stage_admin_dispatches_to_scheduler() -> None:
             )
         )
 
-        assert scheduler.calls == [("pause_generation", {"mode": "in_place"})]
-        result_msg = control_plane.completions[0]
+        assert stage.scheduler.calls == [("pause_generation", {"mode": "in_place"})]
+        result_msg = stage.control_plane.completions[0]
         assert isinstance(result_msg, AdminResultMessage)
         assert result_msg.result.success is True
         assert result_msg.result.data["action"] == "pause_generation"

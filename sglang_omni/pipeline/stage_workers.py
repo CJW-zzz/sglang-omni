@@ -608,7 +608,6 @@ def run_process(
             memory_control = WorkerMemoryControl(handlers, worker=spec.process_name)
             for stage in stages:
                 stage.memory_control = memory_control
-                stage.scheduler.memory_worker_shared = len(stages) > 1
         asyncio.run(_start_and_run())
     except BaseException:
         cleanup_constructed_stages(

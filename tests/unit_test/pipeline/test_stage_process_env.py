@@ -42,45 +42,43 @@ def memory_saver_adapter(monkeypatch: pytest.MonkeyPatch) -> Mock:
     return create
 
 
-@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("preload", [None, "existing-preload"])
 @pytest.mark.parametrize("stage_count", [1, 2])
-def test_memory_saver_configures_each_worker_once(
+def test_memory_saver_configures_workers_independently(
     monkeypatch: pytest.MonkeyPatch,
     memory_saver_adapter: Mock,
-    enabled: bool,
+    preload: str | None,
     stage_count: int,
 ) -> None:
-    monkeypatch.setenv("LD_PRELOAD", "existing-preload")
-    spec = _worker_spec(
-        *(
-            StageLaunchConfig(
-                stage_name=f"stage-{index}",
-                typed_kwargs={
-                    "server_args_overrides": {"enable_memory_saver": enabled}
-                },
-            )
-            for index in range(stage_count)
-        )
-    )
-    with patched_spawn_env(spec):
-        assert os.environ["LD_PRELOAD"] == (
-            "memory-saver-test" if enabled else "existing-preload"
-        )
-    assert os.environ["LD_PRELOAD"] == "existing-preload"
-    if enabled:
-        memory_saver_adapter.assert_called_once_with(True)
-        memory_saver_adapter.return_value.configure_subprocess.assert_called_once_with()
+    if preload is None:
+        monkeypatch.delenv("LD_PRELOAD", raising=False)
     else:
-        memory_saver_adapter.assert_not_called()
-
-
-def test_memory_saver_defaults_to_disabled(memory_saver_adapter: Mock) -> None:
-    spec = _worker_spec(
-        StageLaunchConfig(stage_name="preprocess"),
-        StageLaunchConfig(stage_name="asr"),
-    )
-    with patched_spawn_env(spec):
-        memory_saver_adapter.assert_not_called()
+        monkeypatch.setenv("LD_PRELOAD", preload)
+    for enabled in (True, False, True, None):
+        typed_kwargs = (
+            {"server_args_overrides": {"enable_memory_saver": enabled}}
+            if enabled is not None
+            else {}
+        )
+        spec = _worker_spec(
+            *(
+                StageLaunchConfig(
+                    stage_name=f"stage-{index}", typed_kwargs=typed_kwargs
+                )
+                for index in range(stage_count)
+            )
+        )
+        with patched_spawn_env(spec):
+            assert os.environ.get("LD_PRELOAD") == (
+                "memory-saver-test" if enabled else preload
+            )
+        assert os.environ.get("LD_PRELOAD") == preload
+        if enabled:
+            memory_saver_adapter.assert_called_once_with(True)
+            memory_saver_adapter.return_value.configure_subprocess.assert_called_once_with()
+        else:
+            memory_saver_adapter.assert_not_called()
+        memory_saver_adapter.reset_mock()
 
 
 @pytest.mark.parametrize("second_enabled", [False, None])
@@ -141,29 +139,6 @@ def test_memory_saver_uses_merged_stage_overrides(
     )
     with patched_spawn_env(spec):
         assert memory_saver_adapter.called is expected_enabled
-
-
-def test_memory_saver_settings_are_independent_between_workers(
-    monkeypatch: pytest.MonkeyPatch, memory_saver_adapter: Mock
-) -> None:
-    monkeypatch.delenv("LD_PRELOAD", raising=False)
-    for index, enabled in enumerate([True, False, True]):
-        spec = StageWorkerProcessSpec(
-            process_name=f"worker-{index}",
-            stage_specs=[
-                StageLaunchConfig(
-                    stage_name=f"stage-{index}",
-                    typed_kwargs={
-                        "server_args_overrides": {"enable_memory_saver": enabled}
-                    },
-                )
-            ],
-        )
-        with patched_spawn_env(spec):
-            assert ("LD_PRELOAD" in os.environ) is enabled
-        assert "LD_PRELOAD" not in os.environ
-    assert memory_saver_adapter.call_count == 2
-    assert memory_saver_adapter.return_value.configure_subprocess.call_count == 2
 
 
 @pytest.mark.parametrize("failure_point", ["configure", "spawn"])

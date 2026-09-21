@@ -70,14 +70,12 @@ class WorkerMemoryControl:
                     raise RuntimeError("Worker stages have inconsistent memory state")
                 if tags:
                     mutated = True
+                    if not releasing:
+                        self.dispatch(first, "apply", action, tags)
+                    for stage in prepared:
+                        self.dispatch(stage, "buffers", action, tags)
                     if releasing:
-                        for stage in prepared:
-                            self.dispatch(stage, "stash", action, tags)
                         self.dispatch(first, "apply", action, tags)
-                    else:
-                        self.dispatch(first, "apply", action, tags)
-                        for stage in prepared:
-                            self.dispatch(stage, "reload", action, tags)
                 results = {
                     stage: self.dispatch(stage, "commit", action, tags)
                     for stage in prepared
