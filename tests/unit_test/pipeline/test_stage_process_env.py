@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import os
+from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 import torch
@@ -21,6 +23,172 @@ from sglang_omni.utils.gpu_memory import get_gpu_startup_lock_path
 from tests.unit_test.fixtures.pipeline_fakes import FakeScheduler, fake_factory_path
 
 cuda_platform = CUDAOmniPlatform()
+
+
+@pytest.fixture
+def memory_saver_adapter(monkeypatch: pytest.MonkeyPatch) -> Mock:
+    from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
+
+    @contextmanager
+    def configure_subprocess() -> Iterator[None]:
+        with monkeypatch.context() as env_patch:
+            env_patch.setenv("LD_PRELOAD", "memory-saver-test")
+            yield
+
+    adapter = Mock()
+    adapter.configure_subprocess.side_effect = configure_subprocess
+    create = Mock(return_value=adapter)
+    monkeypatch.setattr(TorchMemorySaverAdapter, "create", create)
+    return create
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("stage_count", [1, 2])
+def test_memory_saver_configures_each_worker_once(
+    monkeypatch: pytest.MonkeyPatch,
+    memory_saver_adapter: Mock,
+    enabled: bool,
+    stage_count: int,
+) -> None:
+    monkeypatch.setenv("LD_PRELOAD", "existing-preload")
+    spec = _worker_spec(
+        *(
+            StageLaunchConfig(
+                stage_name=f"stage-{index}",
+                typed_kwargs={
+                    "server_args_overrides": {"enable_memory_saver": enabled}
+                },
+            )
+            for index in range(stage_count)
+        )
+    )
+    with patched_spawn_env(spec):
+        assert os.environ["LD_PRELOAD"] == (
+            "memory-saver-test" if enabled else "existing-preload"
+        )
+    assert os.environ["LD_PRELOAD"] == "existing-preload"
+    if enabled:
+        memory_saver_adapter.assert_called_once_with(True)
+        memory_saver_adapter.return_value.configure_subprocess.assert_called_once_with()
+    else:
+        memory_saver_adapter.assert_not_called()
+
+
+def test_memory_saver_defaults_to_disabled(memory_saver_adapter: Mock) -> None:
+    spec = _worker_spec(
+        StageLaunchConfig(stage_name="preprocess"),
+        StageLaunchConfig(stage_name="asr"),
+    )
+    with patched_spawn_env(spec):
+        memory_saver_adapter.assert_not_called()
+
+
+@pytest.mark.parametrize("second_enabled", [False, None])
+def test_memory_saver_rejects_inconsistent_worker_settings(
+    monkeypatch: pytest.MonkeyPatch,
+    memory_saver_adapter: Mock,
+    second_enabled: bool | None,
+) -> None:
+    monkeypatch.setenv("SGLANG_TEST_STAGE_ENV", "original")
+    second_overrides = (
+        {} if second_enabled is None else {"enable_memory_saver": second_enabled}
+    )
+    spec = _worker_spec(
+        StageLaunchConfig(
+            stage_name="asr",
+            factory_kwargs={"server_args_overrides": {"enable_memory_saver": True}},
+        ),
+        StageLaunchConfig(
+            stage_name="talker",
+            typed_kwargs={"server_args_overrides": second_overrides},
+        ),
+    )
+    with pytest.raises(ValueError, match="consistent enable_memory_saver"):
+        with patched_spawn_env(spec, {"SGLANG_TEST_STAGE_ENV": "modified"}):
+            pytest.fail("inconsistent worker settings must fail before spawn")
+    memory_saver_adapter.assert_not_called()
+    assert os.environ["SGLANG_TEST_STAGE_ENV"] == "original"
+
+
+@pytest.mark.parametrize(
+    ("factory_enabled", "typed_overrides", "expected_enabled"),
+    [
+        (True, {"enable_memory_saver": False}, False),
+        (False, {"enable_memory_saver": True}, True),
+        (True, {"disable_cuda_graph": True}, True),
+    ],
+)
+def test_memory_saver_uses_merged_stage_overrides(
+    memory_saver_adapter: Mock,
+    factory_enabled: bool,
+    typed_overrides: dict[str, bool],
+    expected_enabled: bool,
+) -> None:
+    spec = _worker_spec(
+        StageLaunchConfig(
+            stage_name="asr",
+            factory_kwargs={
+                "server_args_overrides": {"enable_memory_saver": factory_enabled}
+            },
+            typed_kwargs={"server_args_overrides": typed_overrides},
+        ),
+        StageLaunchConfig(
+            stage_name="talker",
+            typed_kwargs={
+                "server_args_overrides": {"enable_memory_saver": expected_enabled}
+            },
+        ),
+    )
+    with patched_spawn_env(spec):
+        assert memory_saver_adapter.called is expected_enabled
+
+
+def test_memory_saver_settings_are_independent_between_workers(
+    monkeypatch: pytest.MonkeyPatch, memory_saver_adapter: Mock
+) -> None:
+    monkeypatch.delenv("LD_PRELOAD", raising=False)
+    for index, enabled in enumerate([True, False, True]):
+        spec = StageWorkerProcessSpec(
+            process_name=f"worker-{index}",
+            stage_specs=[
+                StageLaunchConfig(
+                    stage_name=f"stage-{index}",
+                    typed_kwargs={
+                        "server_args_overrides": {"enable_memory_saver": enabled}
+                    },
+                )
+            ],
+        )
+        with patched_spawn_env(spec):
+            assert ("LD_PRELOAD" in os.environ) is enabled
+        assert "LD_PRELOAD" not in os.environ
+    assert memory_saver_adapter.call_count == 2
+    assert memory_saver_adapter.return_value.configure_subprocess.call_count == 2
+
+
+@pytest.mark.parametrize("failure_point", ["configure", "spawn"])
+def test_memory_saver_restores_environment_after_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    memory_saver_adapter: Mock,
+    failure_point: str,
+) -> None:
+    monkeypatch.setenv("LD_PRELOAD", "existing-preload")
+    monkeypatch.setenv("SGLANG_TEST_STAGE_ENV", "original")
+    if failure_point == "configure":
+        memory_saver_adapter.side_effect = RuntimeError("configure failed")
+    spec = _worker_spec(
+        StageLaunchConfig(
+            stage_name="asr",
+            typed_kwargs={"server_args_overrides": {"enable_memory_saver": True}},
+        )
+    )
+    with pytest.raises(RuntimeError, match=f"{failure_point} failed"):
+        with patched_spawn_env(spec, {"SGLANG_TEST_STAGE_ENV": "modified"}):
+            assert os.environ["LD_PRELOAD"] == "memory-saver-test"
+            assert os.environ["SGLANG_TEST_STAGE_ENV"] == "modified"
+            raise RuntimeError("spawn failed")
+    assert os.environ["LD_PRELOAD"] == "existing-preload"
+    assert os.environ["SGLANG_TEST_STAGE_ENV"] == "original"
 
 
 @pytest.fixture(autouse=True)

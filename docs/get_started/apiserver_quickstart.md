@@ -216,3 +216,45 @@ If you see a 500 error, check the server logs for the full traceback. Common iss
 
 - [API Server Design](../developer_reference/apiserver_design.md)
 - [Developer Reference](../developer_reference/main.md)
+
+## Stage memory release and resume
+
+SGLang-backed stages can release managed GPU allocations while idle and restore
+them before the next inference. For MOSS-Transcribe-Diarize, add
+`--asr.engine.enable_memory_saver true` to the launch command.
+
+Memory control is **worker/process-scoped**: selecting one stage affects every
+stage in its worker. Colocated stages must all enable memory saver and support
+the SGLang memory lifecycle; an omitted setting means `false`. Different workers
+can use different settings. Currently, only `tp_size=1` is supported, without
+prefill/decode disaggregation (PD) or shared weight caches.
+
+```bash
+curl -X POST http://localhost:8000/release_memory_occupation \
+  -H 'Content-Type: application/json' \
+  -d '{"stages": ["asr"], "tags": ["weights", "kv_cache", "cuda_graph"]}'
+
+curl -X POST http://localhost:8000/resume_memory_occupation \
+  -H 'Content-Type: application/json' \
+  -d '{"stages": ["asr"]}'
+```
+
+These endpoints use the admin authentication configured for `/pause_generation`.
+Omitting `stages` targets all stages, including unsupported stages, which return
+an error. Omitted or empty `tags` selects all three allocation types. The Python
+client provides matching methods accepting a `{"tags": [...]}` payload, `stages`,
+and `timeout_s`.
+
+Release rejects busy workers without aborting requests. Released stages reject
+new inference until all released tags are resumed; an explicit generation pause
+is preserved. Repeated calls are idempotent. Failures during release or restore
+keep the worker paused and require a restart.
+
+Responses report `worker`, `affected_stages`, and per-stage state. Operations are
+not atomic across workers. `/model_info` also exposes released tags and failure
+state. Weights are backed up to CPU; CUDA contexts and allocations outside the
+managed allocator may remain on the GPU.
+
+To validate a deployment, compare GPU memory and transcription output before
+release and after resume using a fixed audio sample. Repeat several cycles and
+verify that release during inference fails without interrupting the request.

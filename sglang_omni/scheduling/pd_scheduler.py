@@ -46,6 +46,14 @@ class PDKVLifecycle(OmniScheduler):
     def pd_lifecycle_guard(self):
         return nullcontext()
 
+    def admin_memory_occupation(
+        self, action: str, payload: dict[str, Any]
+    ) -> dict[str, Any]:
+        raise RuntimeError("Memory occupation control does not support PD stages")
+
+    def admin_memory_phase(self, payload: dict[str, Any]) -> dict[str, Any]:
+        raise RuntimeError("Memory occupation control does not support PD stages")
+
     def lease_pd_kv(self, req) -> SGLangKVLease:
         lease = SGLangKVLease(req, self.pd_due_releases)
         self.pd_outstanding_releases.add(req.rid)

@@ -6,6 +6,7 @@ import asyncio
 import base64
 import logging
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -839,6 +840,29 @@ def test_speech_endpoint_stream_empty_delta_is_not_success() -> None:
     assert response.status_code == 500
     assert response.json()["error"]["type"] == "server_error"
     assert "No audio output generated" in response.json()["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    "action", ["release_memory_occupation", "resume_memory_occupation"]
+)
+def test_memory_routes_forward_and_validate(action) -> None:
+    admin = AdminClient()
+    handler = AsyncMock(return_value={"success": True, "results": []})
+    setattr(admin, action, handler)
+    client = TestClient(create_app(admin, model_name="asr"))
+    response = client.post(
+        f"/{action}",
+        json={"stages": ["asr"], "tags": ["weights", "kv_cache"], "timeout_s": 12},
+    )
+    assert response.status_code == 200
+    handler.assert_awaited_once_with(
+        {"tags": ["weights", "kv_cache"]},
+        stages=["asr"],
+        timeout_s=12,
+    )
+    assert client.post(f"/{action}", json={"tags": ["invalid"]}).status_code == 422
+    handler.return_value = {"success": False, "message": "stage is busy"}
+    assert client.post(f"/{action}", json={}).status_code == 400
 
 
 def test_admin_routes_forward_to_client() -> None:
@@ -3406,6 +3430,8 @@ ADMIN_PATHS_THAT_NEED_AUTH = [
     ("GET", "/model_info"),
     ("POST", "/model_info"),
     ("POST", "/pause_generation"),
+    ("POST", "/release_memory_occupation"),
+    ("POST", "/resume_memory_occupation"),
     ("POST", "/continue_generation"),
     ("POST", "/update_weights_from_disk"),
     ("POST", "/update_weights_from_tensor"),
