@@ -28,7 +28,7 @@ from tests.unit_test.fixtures.mini_checkpoint import write_mini_llama_checkpoint
 
 
 @pytest.mark.parametrize("enable_memory_saver", [False, True])
-def test_memory_saver_preserves_weights_on_resume(
+def test_memory_saver_enables_weights_cpu_backup(
     tmp_path: Path, enable_memory_saver: bool
 ) -> None:
     server_args = build_sglang_server_args(

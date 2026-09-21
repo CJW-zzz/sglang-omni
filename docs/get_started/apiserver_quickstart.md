@@ -247,7 +247,7 @@ and `timeout_s`.
 
 Release rejects busy workers without aborting requests. Released stages reject
 new inference until all released tags are resumed; an explicit generation pause
-is preserved. Repeated calls are idempotent. Failures during release or restore
+is preserved. Repeated calls are idempotent. Failures after memory mutation starts
 keep the worker paused and require a restart.
 
 Responses report `worker`, `affected_stages`, and per-stage state. Operations are
