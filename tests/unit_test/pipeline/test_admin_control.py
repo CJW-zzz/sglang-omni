@@ -6,6 +6,8 @@ import asyncio
 import queue
 import threading
 import time
+from collections import deque
+from concurrent.futures import Future
 from functools import partial
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -24,6 +26,7 @@ from sglang_omni.proto import (
 )
 from sglang_omni.proto.admin import ADMIN_MEMORY_CONTROL
 from sglang_omni.scheduling.memory_control import WorkerMemoryControl
+from sglang_omni.scheduling.types import DeferredAdmission
 from tests.unit_test.fixtures.pipeline_fakes import (
     FakeRelay,
     FakeScheduler,
@@ -67,6 +70,7 @@ def make_memory_scheduler():
     scheduler.memory_transition_failed = False
     scheduler.memory_pause_before_transition = False
     scheduler.paused_before_memory_release = False
+    scheduler.request_build_idle_callback = None
     scheduler._deferred_request_payloads = {}
     scheduler._pending_stream_ingress = {}
     scheduler.resolve_pending_async = Mock()
@@ -267,11 +271,18 @@ def test_worker_memory_runs_phases_on_each_scheduler_thread(worker_memory) -> No
     stop = threading.Event()
     threads = []
     ready_events = []
-    for scheduler in schedulers.values():
+    phase_threads = []
+    for name, scheduler in schedulers.items():
         scheduler._running = True
         scheduler._admin_queue = queue.Queue()
         scheduler._scheduler_thread_id = None
         ready = threading.Event()
+
+        def record_phase(payload, stage=name, handler=scheduler.admin_memory_phase):
+            phase_threads.append((stage, threading.get_ident()))
+            return handler(payload)
+
+        scheduler.admin_memory_phase = record_phase
 
         def run(peer=scheduler, event=ready):
             peer._scheduler_thread_id = threading.get_ident()
@@ -300,6 +311,79 @@ def test_worker_memory_runs_phases_on_each_scheduler_thread(worker_memory) -> No
         for thread in threads:
             thread.join(1)
     assert all(not thread.is_alive() for thread in threads)
+    assert {stage for stage, _ in phase_threads} == set(schedulers)
+    assert all(
+        thread_id == schedulers[stage]._scheduler_thread_id
+        for stage, thread_id in phase_threads
+    )
+
+
+@pytest.mark.parametrize("pending_kind", ["builder", "admission", "builder_admission"])
+@pytest.mark.parametrize("evict_aborts", [False, True])
+def test_memory_waits_for_aborted_request_work(
+    memory_scheduler, pending_kind, evict_aborts, monkeypatch
+) -> None:
+    scheduler = memory_scheduler
+    del scheduler.active_request_ids
+    scheduler._request_admission_lock = threading.RLock()
+    scheduler._aborted_request_ids = set()
+    scheduler._aborted_request_id_order = deque()
+    scheduler._backlogged_request_build_payloads = deque()
+    scheduler._pending_request_builds = {}
+    scheduler._pending_request_admissions = {}
+    scheduler._dirty_deferred_request_ids = set()
+    scheduler._first_emit_done = set()
+    scheduler._prefill_start_done = set()
+    scheduler._prefill_end_done = set()
+    scheduler._abort_callback = None
+    scheduler.waiting_queue = []
+    scheduler.running_batch = scheduler.cur_batch = scheduler.last_batch = None
+    scheduler._async_pending = None
+    scheduler._idle_wait_message = None
+    scheduler.inbox = queue.Queue()
+    scheduler.enqueue_built_request = Mock()
+    payload = SimpleNamespace(request_id="cancelled")
+    builder = Future()
+    builder.set_running_or_notify_cancel()
+    ready = Future()
+    deferred = DeferredAdmission(value=object(), ready=ready)
+    if pending_kind == "admission":
+        scheduler._pending_request_admissions[payload.request_id] = (
+            payload,
+            False,
+            deferred,
+        )
+    else:
+        scheduler._pending_request_builds[payload.request_id] = (
+            payload,
+            False,
+            builder,
+        )
+
+    scheduler.abort(payload.request_id)
+    if evict_aborts:
+        from sglang_omni.scheduling import omni_scheduler
+
+        monkeypatch.setattr(omni_scheduler, "_ABORTED_REQUEST_ID_LIMIT", 2)
+        monkeypatch.setattr(omni_scheduler, "_ABORTED_REQUEST_ID_RETAINED", 1)
+        for index in range(3):
+            scheduler.abort(f"other-{index}")
+    with pytest.raises(RuntimeError, match="active requests"):
+        scheduler.admin_memory_occupation("release_memory_occupation", {})
+    scheduler.memory_allocator.pause.assert_not_called()
+
+    if pending_kind == "builder_admission":
+        builder.set_result(deferred)
+        scheduler.drain_request_build_results()
+        with pytest.raises(RuntimeError, match="active requests"):
+            scheduler.admin_memory_occupation("release_memory_occupation", {})
+    elif pending_kind == "builder":
+        builder.set_result(object())
+    ready.set_result(None)
+    scheduler.drain_request_build_results()
+    scheduler.drain_request_admission_results()
+    assert scheduler.admin_memory_occupation("release_memory_occupation", {})["success"]
+    scheduler.enqueue_built_request.assert_not_called()
 
 
 def test_memory_partial_resume_and_idempotency(memory_scheduler) -> None:
@@ -345,6 +429,32 @@ def test_memory_requires_enabled_allocator(memory_scheduler) -> None:
     memory_scheduler.tp_worker.model_runner.server_args.enable_memory_saver = False
     with pytest.raises(RuntimeError, match="enable_memory_saver"):
         memory_scheduler.admin_memory_occupation("release_memory_occupation", {})
+
+
+def test_memory_waits_for_timed_out_encoder_work(memory_scheduler) -> None:
+    from sglang_omni.models.moss_transcribe_diarize.encoder_service import (
+        BatchedAudioEncoderService,
+    )
+
+    service = object.__new__(BatchedAudioEncoderService)
+    service._queue = queue.Queue()
+    service._worker_state_lock = threading.Lock()
+    service._worker_error = None
+    service.pending_futures = set()
+    service.ENCODE_TIMEOUT_S = 0
+    memory_scheduler.request_build_idle_callback = service.is_idle
+    with pytest.raises(TimeoutError):
+        service.encode_item(SimpleNamespace())
+    entry = service._queue.get_nowait()
+    entry.future.cancel()
+    with pytest.raises(RuntimeError, match="active requests"):
+        memory_scheduler.admin_memory_occupation("release_memory_occupation", {})
+    memory_scheduler.memory_allocator.pause.assert_not_called()
+
+    service.set_result(entry, object())
+    assert memory_scheduler.admin_memory_occupation("release_memory_occupation", {})[
+        "success"
+    ]
 
 
 def test_memory_rejects_unsynchronized_tp_control(memory_scheduler) -> None:
@@ -954,7 +1064,19 @@ def test_coordinator_admin_waits_for_all_stage_results() -> None:
     asyncio.run(run())
 
 
-def test_stage_memory_admin_rejects_unsupported_scheduler() -> None:
+@pytest.mark.parametrize(
+    "action, has_handler, error",
+    [
+        ("release_memory_occupation", False, "does not support memory"),
+        (ADMIN_MEMORY_CONTROL, False, "internal worker operations"),
+        (ADMIN_MEMORY_CONTROL, True, "internal worker operations"),
+    ],
+)
+def test_stage_rejects_unsupported_memory_admin(action, has_handler, error) -> None:
+    scheduler = FakeScheduler()
+    handler = Mock()
+    if has_handler:
+        scheduler.admin = handler
     stage = Stage(
         name="preprocess",
         role="single",
@@ -963,15 +1085,14 @@ def test_stage_memory_admin_rejects_unsupported_scheduler() -> None:
         endpoints={},
         control_plane=RecordingStageControlPlane(),
         relay=FakeRelay(),
-        scheduler=FakeScheduler(),
+        scheduler=scheduler,
     )
     result = asyncio.run(
-        stage.run_admin_operation(
-            AdminOperation(op_id="memory", action="release_memory_occupation")
-        )
+        stage.run_admin_operation(AdminOperation(op_id="memory", action=action))
     )
     assert not result.success
-    assert "does not support memory" in result.error
+    assert error in result.error
+    handler.assert_not_called()
 
 
 def test_stage_admin_dispatches_to_scheduler() -> None:

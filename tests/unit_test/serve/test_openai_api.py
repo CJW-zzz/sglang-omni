@@ -845,11 +845,14 @@ def test_speech_endpoint_stream_empty_delta_is_not_success() -> None:
 @pytest.mark.parametrize(
     "action", ["release_memory_occupation", "resume_memory_occupation"]
 )
-def test_memory_routes_forward_and_validate(action) -> None:
+def test_memory_routes_forward_and_validate(action: str) -> None:
     admin = AdminClient()
     handler = AsyncMock(return_value={"success": True, "results": []})
     setattr(admin, action, handler)
-    client = TestClient(create_app(admin, model_name="asr"))
+    client = TestClient(
+        create_app(admin, model_name="asr", admin_api_key=_ADMIN_API_KEY),
+        headers=_admin_headers(),
+    )
     response = client.post(
         f"/{action}",
         json={"stages": ["asr"], "tags": ["weights", "kv_cache"], "timeout_s": 12},
@@ -860,9 +863,28 @@ def test_memory_routes_forward_and_validate(action) -> None:
         stages=["asr"],
         timeout_s=12,
     )
-    assert client.post(f"/{action}", json={"tags": ["invalid"]}).status_code == 422
-    handler.return_value = {"success": False, "message": "stage is busy"}
-    assert client.post(f"/{action}", json={}).status_code == 400
+    for body, payload, timeout in (
+        ({}, {}, 300.0),
+        ({"tags": None, "timeout_s": None}, {}, 300.0),
+        ({"tags": [], "timeout_s": 0}, {"tags": []}, 0),
+    ):
+        handler.reset_mock()
+        response = client.post(f"/{action}", json=body)
+        assert response.status_code == 200
+        handler.assert_awaited_once_with(payload, stages=None, timeout_s=timeout)
+
+    handler.reset_mock()
+    for tags in (["invalid"], "weights", [1]):
+        response = client.post(f"/{action}", json={"tags": tags})
+        assert response.status_code == 422
+    handler.assert_not_awaited()
+
+    for message in ("stage is busy", "stage does not support memory control"):
+        result = {"success": False, "message": message}
+        handler.return_value = result
+        response = client.post(f"/{action}", json={})
+        assert response.status_code == 400
+        assert response.json()["detail"] == result
 
 
 def test_admin_routes_forward_to_client() -> None:
