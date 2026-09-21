@@ -252,8 +252,9 @@ keep the worker paused and require a restart.
 
 Responses report `worker`, `affected_stages`, and per-stage state. Operations are
 not atomic across workers. `/model_info` also exposes released tags and failure
-state. Weights are backed up to CPU; CUDA contexts and allocations outside the
-managed allocator may remain on the GPU.
+state. Enabling memory saver also enables CPU weight backups, so allow enough
+host RAM for the weights. CUDA contexts and allocations outside the managed
+allocator may remain on the GPU.
 
 To validate a deployment, compare GPU memory and transcription output before
 release and after resume using a fixed audio sample. Repeat several cycles and
