@@ -187,8 +187,7 @@ def worker_memory_saver_enabled(spec: StageWorkerProcessSpec) -> bool:
             f"Process {spec.process_name!r} requires consistent enable_memory_saver "
             f"settings across its stages: {memory_saver_settings}"
         )
-    else:
-        return any(memory_saver_settings.values())
+    return any(memory_saver_settings.values())
 
 
 @contextmanager
