@@ -107,7 +107,7 @@ def test_successful_dispatch_attaches_and_caches() -> None:
 
 
 def test_timed_out_and_cancelled_submissions_stay_busy_until_worker_finishes() -> None:
-    service = _Service(controlled_drain=True)
+    service = Service(controlled_drain=True)
     try:
         timed_out = service.submit(1)
         cancelled = service.submit(2)
